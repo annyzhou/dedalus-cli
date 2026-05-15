@@ -15,6 +15,7 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -35,12 +36,12 @@ const (
 
 func init() {
 	Command.Commands = append(Command.Commands, &cli.Command{
-		Name:      "ssh",
-		Usage:     "SSH into a running machine",
-		UsageText: "dedalus ssh <machine_id>",
-		Category:  "MACHINE",
-		Suggest:   true,
-		Flags:  []cli.Flag{},
+		Name:            "ssh",
+		Usage:           "SSH into a running machine",
+		UsageText:       "dedalus ssh <machine_id>",
+		Category:        "MACHINE",
+		Suggest:         true,
+		Flags:           []cli.Flag{},
 		Action:          handleSSH,
 		HideHelpCommand: true,
 	})
@@ -118,7 +119,8 @@ func awaitSSHSession(
 	if err != nil {
 		return nil, fmt.Errorf("create ssh session: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "ssh %s: %s\n", resp.SessionID, resp.Status)
+	lastStatus := dedalus.SSHSessionStatus("")
+	lastStatus = printSSHStatusIfChanged(os.Stderr, resp.SessionID, resp.Status, lastStatus)
 
 	for i := 0; i < sshPollMax; i++ {
 		switch resp.Status {
@@ -153,9 +155,16 @@ func awaitSSHSession(
 		if err != nil {
 			return nil, fmt.Errorf("poll ssh session: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "ssh %s: %s\n", resp.SessionID, resp.Status)
+		lastStatus = printSSHStatusIfChanged(os.Stderr, resp.SessionID, resp.Status, lastStatus)
 	}
 	return nil, fmt.Errorf("SSH session did not become ready after %d polls (%v); the Dedalus Machine may be unresponsive or the SSH gateway may be down", sshPollMax, time.Duration(sshPollMax)*sshPollInterval)
+}
+
+func printSSHStatusIfChanged(output io.Writer, sessionID string, status dedalus.SSHSessionStatus, last dedalus.SSHSessionStatus) dedalus.SSHSessionStatus {
+	if status != last {
+		fmt.Fprintf(output, "ssh %s: %s\n", sessionID, status)
+	}
+	return status
 }
 
 func runSSH(ctx context.Context, keyPath, certPath, khPath string, conn dedalus.SSHConnection) error {

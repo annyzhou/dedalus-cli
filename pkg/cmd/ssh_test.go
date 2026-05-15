@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/dedalus-labs/dedalus-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	gossh "golang.org/x/crypto/ssh"
@@ -95,6 +97,18 @@ func TestKnownHostsLine_format(t *testing.T) {
 	assert.Equal(t, "@cert-authority", fields[0])
 	assert.Equal(t, hostPattern, fields[1])
 	assert.Equal(t, "ssh-ed25519", fields[2])
+}
+
+func TestPrintSSHStatusIfChangedSuppressesRepeatedStatus(t *testing.T) {
+	var output bytes.Buffer
+	last := dedalus.SSHSessionStatus("")
+
+	last = printSSHStatusIfChanged(&output, "dssh-test", dedalus.SSHSessionStatusWakeInProgress, last)
+	last = printSSHStatusIfChanged(&output, "dssh-test", dedalus.SSHSessionStatusWakeInProgress, last)
+	last = printSSHStatusIfChanged(&output, "dssh-test", dedalus.SSHSessionStatusReady, last)
+
+	assert.Equal(t, "ssh dssh-test: wake_in_progress\nssh dssh-test: ready\n", output.String())
+	assert.Equal(t, dedalus.SSHSessionStatusReady, last)
 }
 
 func TestSSHArgs_structure(t *testing.T) {
