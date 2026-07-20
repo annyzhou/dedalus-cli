@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/dedalus-labs/dedalus-cli/internal/feedbackdiag"
 	"github.com/dedalus-labs/dedalus-cli/internal/jsonview"
 	"github.com/dedalus-labs/dedalus-go/option"
 
@@ -41,10 +42,12 @@ func ValidateBaseURL(value, source string) error {
 func getDefaultRequestOptions(cmd *cli.Command) []option.RequestOption {
 	opts := []option.RequestOption{
 		option.WithHeader("User-Agent", fmt.Sprintf("Dedalus/CLI %s", Version)),
+		option.WithHeader("X-Dedalus-CLI-Command", cmd.FullName()),
 		option.WithHeader("X-Stainless-Lang", "cli"),
 		option.WithHeader("X-Stainless-Package-Version", Version),
 		option.WithHeader("X-Stainless-Runtime", "cli"),
 		option.WithHeader("X-Stainless-CLI-Command", cmd.FullName()),
+		option.WithMiddleware(feedbackdiag.Middleware()),
 	}
 	if cmd.IsSet("api-key") {
 		opts = append(opts, option.WithAPIKey(cmd.String("api-key")))
