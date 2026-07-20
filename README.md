@@ -70,6 +70,17 @@ The CLI follows a resource-based command structure:
 dedalus [resource] <command> [flags...]
 ```
 
+Send non-interactive product feedback or report a failed command:
+
+```sh
+dedalus feedback "ssh hangs after machine starts"
+dedalus feedback --include-logs=false "please add a way to name machines"
+dedalus feedback --include-logs=true "machine create returned 500"
+```
+
+`--include-logs` accepts `auto` (the default), `true`, or `false`. Only
+first-party Dedalus diagnostic artifacts can be uploaded.
+
 ```sh
 dedalus machines create \
   --api-key 'My API Key' \
