@@ -55,6 +55,23 @@ func TestFeedbackCommandSendsJSONWithoutLogs(t *testing.T) {
 	require.JSONEq(t, `{"id":"feedback_123"}`, output.String())
 }
 
+func TestFeedbackCommandRejectsOversizedMessageBeforeNetwork(t *testing.T) {
+	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
+	attempts := 0
+	setFeedbackTransport(t, func(r *http.Request) *http.Response {
+		attempts++
+		return feedbackResponse(`{"id":"unexpected"}`)
+	})
+
+	err := testFeedbackCommand(io.Discard).Run(
+		context.Background(),
+		[]string{"dedalus", "feedback", strings.Repeat("x", feedbackMessageMaxCharacters+1)},
+	)
+
+	require.EqualError(t, err, "message must be at most 10000 characters")
+	require.Zero(t, attempts)
+}
+
 func TestFeedbackCommandRetriesWithSameIdempotencyKey(t *testing.T) {
 	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
 	originalDelay := feedbackRetryDelay
@@ -85,6 +102,165 @@ func TestFeedbackCommandRetriesWithSameIdempotencyKey(t *testing.T) {
 	require.Equal(t, keys[0], keys[1])
 }
 
+func TestFeedbackCommandPersistsRequestAcrossProcessRestart(t *testing.T) {
+	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
+	t.Setenv("DEDALUS_FEEDBACK_OUTBOX_DIR", filepath.Join(t.TempDir(), "feedback"))
+	originalClient := feedbackHTTPClient
+	originalDelay := feedbackRetryDelay
+	feedbackRetryDelay = 0
+	t.Cleanup(func() {
+		feedbackHTTPClient = originalClient
+		feedbackRetryDelay = originalDelay
+	})
+
+	var keys []string
+	var bodies [][]byte
+	feedbackHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		keys = append(keys, request.Header.Get("Idempotency-Key"))
+		bodies = append(bodies, body)
+		return nil, errors.New("connection reset after write")
+	})}
+
+	first := testFeedbackCommand(io.Discard).Run(
+		context.Background(),
+		[]string{"dedalus", "--base-url", "https://api.test", "feedback", "persist me"},
+	)
+	require.ErrorContains(t, first, "connection reset after write")
+	pending, err := loadFeedbackOutbox()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	require.Equal(t, pending[0].IdempotencyKey, keys[0])
+	require.Equal(t, pending[0].Body, bodies[0])
+
+	feedbackHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		keys = append(keys, request.Header.Get("Idempotency-Key"))
+		bodies = append(bodies, body)
+		return feedbackResponse(`{"id":"feedback_persisted"}`), nil
+	})}
+	second := testFeedbackCommand(io.Discard).Run(
+		context.Background(),
+		[]string{"dedalus", "--base-url", "https://api.test", "feedback", "persist me"},
+	)
+	require.NoError(t, second)
+	require.Len(t, keys, 3)
+	require.Equal(t, keys[0], keys[1])
+	require.Equal(t, keys[0], keys[2])
+	require.Equal(t, bodies[0], bodies[1])
+	require.Equal(t, bodies[0], bodies[2])
+	pending, err = loadFeedbackOutbox()
+	require.NoError(t, err)
+	require.Empty(t, pending)
+}
+
+func TestFeedbackOutboxUsesPrivatePermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "feedback")
+	t.Setenv("DEDALUS_FEEDBACK_OUTBOX_DIR", dir)
+	pending := feedbackPendingRequest{
+		Version:         feedbackOutboxVersion,
+		IdempotencyKey:  "01973f7b7cf6726a9a9f4f37d4b47a21",
+		Endpoint:        "https://api.test/v1/feedback",
+		AuthFingerprint: "credential-hash",
+		Message:         "private report",
+		ContentType:     "application/json",
+		Body:            []byte(`{"message":"private report"}`),
+		CreatedAt:       time.Now().UTC(),
+	}
+
+	saved, err := saveFeedbackPending(pending)
+	require.NoError(t, err)
+	dirInfo, err := os.Stat(dir)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o700), dirInfo.Mode().Perm())
+	fileInfo, err := os.Stat(saved.path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), fileInfo.Mode().Perm())
+}
+
+func TestFeedbackCommandDoesNotReplayWithDifferentCredentials(t *testing.T) {
+	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
+	attempts := 0
+	setFeedbackTransport(t, func(r *http.Request) *http.Response {
+		attempts++
+		return feedbackResponse(`{"id":"unexpected"}`)
+	})
+	pending := feedbackPendingRequest{
+		Version:         feedbackOutboxVersion,
+		IdempotencyKey:  "01973f7b7cf6726a9a9f4f37d4b47a21",
+		Endpoint:        "https://api.test/v1/feedback",
+		AuthFingerprint: "different-credentials",
+		Message:         "private report",
+		ContentType:     "application/json",
+		Body:            []byte(`{"message":"private report"}`),
+		CreatedAt:       time.Now().UTC(),
+	}
+	_, err := saveFeedbackPending(pending)
+	require.NoError(t, err)
+
+	err = testFeedbackCommand(io.Discard).Run(
+		context.Background(),
+		[]string{"dedalus", "--api-key", "new-key", "feedback", "new report"},
+	)
+
+	require.EqualError(t, err, "pending feedback was created with different CLI credentials")
+	require.Zero(t, attempts)
+	stored, loadErr := loadFeedbackOutbox()
+	require.NoError(t, loadErr)
+	require.Len(t, stored, 1)
+}
+
+func TestFeedbackCommandDoesNotReplayToDifferentEndpoint(t *testing.T) {
+	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
+	attempts := 0
+	setFeedbackTransport(t, func(r *http.Request) *http.Response {
+		attempts++
+		return feedbackResponse(`{"id":"unexpected"}`)
+	})
+	command := testFeedbackCommand(io.Discard)
+	pending := feedbackPendingRequest{
+		Version:         feedbackOutboxVersion,
+		IdempotencyKey:  "01973f7b7cf6726a9a9f4f37d4b47a21",
+		Endpoint:        "https://old-api.test/v1/feedback",
+		AuthFingerprint: feedbackAuthFingerprint(command),
+		Message:         "private report",
+		ContentType:     "application/json",
+		Body:            []byte(`{"message":"private report"}`),
+		CreatedAt:       time.Now().UTC(),
+	}
+	_, err := saveFeedbackPending(pending)
+	require.NoError(t, err)
+
+	err = command.Run(
+		context.Background(),
+		[]string{"dedalus", "--base-url", "https://new-api.test", "feedback", "new report"},
+	)
+
+	require.EqualError(t, err, "pending feedback was created for a different API endpoint")
+	require.Zero(t, attempts)
+	stored, loadErr := loadFeedbackOutbox()
+	require.NoError(t, loadErr)
+	require.Len(t, stored, 1)
+}
+
+func TestFeedbackCommandRetainsAcceptedRequestWithInvalidReceipt(t *testing.T) {
+	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
+	setFeedbackTransport(t, func(r *http.Request) *http.Response {
+		return feedbackResponse("not-json")
+	})
+
+	err := testFeedbackCommand(io.Discard).Run(
+		context.Background(),
+		[]string{"dedalus", "--base-url", "https://api.test", "feedback", "retain me"},
+	)
+	require.EqualError(t, err, "feedback response is not valid JSON")
+	pending, loadErr := loadFeedbackOutbox()
+	require.NoError(t, loadErr)
+	require.Len(t, pending, 1)
+}
+
 func TestFeedbackCommandDoesNotRetryNonRetryableFailure(t *testing.T) {
 	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
 	attempts := 0
@@ -102,6 +278,9 @@ func TestFeedbackCommandDoesNotRetryNonRetryableFailure(t *testing.T) {
 	)
 	require.ErrorContains(t, err, "502 Bad Gateway")
 	require.Equal(t, 1, attempts)
+	pending, loadErr := loadFeedbackOutbox()
+	require.NoError(t, loadErr)
+	require.Empty(t, pending)
 }
 
 func TestFeedbackCommandRetriesUnreadableResponse(t *testing.T) {
@@ -304,6 +483,7 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 
 func setFeedbackTransport(t *testing.T, handler func(*http.Request) *http.Response) {
 	t.Helper()
+	t.Setenv("DEDALUS_FEEDBACK_OUTBOX_DIR", filepath.Join(t.TempDir(), "feedback"))
 	original := feedbackHTTPClient
 	feedbackHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return handler(request), nil
@@ -312,7 +492,7 @@ func setFeedbackTransport(t *testing.T, handler func(*http.Request) *http.Respon
 }
 
 func feedbackResponse(body string) *http.Response {
-	return feedbackStatusResponse(http.StatusCreated, body)
+	return feedbackStatusResponse(http.StatusAccepted, body)
 }
 
 func feedbackStatusResponse(statusCode int, body string) *http.Response {
