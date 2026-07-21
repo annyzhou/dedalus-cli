@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/urfave/cli/v3"
 )
 
@@ -22,6 +23,7 @@ const feedbackProductionURL = "https://api.dedaluslabs.ai"
 
 var feedbackHTTPClient = &http.Client{Timeout: 30 * time.Second}
 var feedbackRequestID = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
+var feedbackRetryDelay = time.Second
 
 func init() {
 	Command.Commands = append(Command.Commands, &feedbackCommand)
@@ -119,17 +121,9 @@ func handleFeedback(ctx context.Context, command *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	response, err := feedbackHTTPClient.Do(request)
+	body, err := submitFeedback(request)
 	if err != nil {
-		return fmt.Errorf("submit feedback: %w", err)
-	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	if err != nil {
-		return fmt.Errorf("read feedback response: %w", err)
-	}
-	if response.StatusCode != http.StatusCreated {
-		return fmt.Errorf("feedback request failed: %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return err
 	}
 	if !json.Valid(body) {
 		return fmt.Errorf("feedback response is not valid JSON")
@@ -167,6 +161,11 @@ func feedbackRequest(ctx context.Context, command *cli.Command, metadata feedbac
 		return nil, fmt.Errorf("create feedback request: %w", err)
 	}
 	request.Header.Set("Content-Type", contentType)
+	idempotencyKey, err := uuid.NewV7()
+	if err != nil {
+		return nil, fmt.Errorf("create feedback idempotency key: %w", err)
+	}
+	request.Header.Set("Idempotency-Key", strings.ReplaceAll(idempotencyKey.String(), "-", ""))
 	request.Header.Set("User-Agent", fmt.Sprintf("Dedalus/CLI %s", Version))
 	request.Header.Set("X-Dedalus-CLI-Command", "dedalus feedback")
 	root := command.Root()
@@ -180,6 +179,80 @@ func feedbackRequest(ctx context.Context, command *cli.Command, metadata feedbac
 		request.Header.Set("X-Dedalus-Org-Id", orgID)
 	}
 	return request, nil
+}
+
+func submitFeedback(request *http.Request) ([]byte, error) {
+	for attempt := range 2 {
+		current := request
+		if attempt > 0 {
+			body, err := request.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("rebuild feedback request: %w", err)
+			}
+			current = request.Clone(request.Context())
+			current.Body = body
+		}
+		response, err := feedbackHTTPClient.Do(current)
+		if err != nil {
+			if attempt == 0 {
+				if waitErr := waitFeedbackRetry(request.Context()); waitErr != nil {
+					return nil, fmt.Errorf("submit feedback: %w", waitErr)
+				}
+				continue
+			}
+			return nil, fmt.Errorf("submit feedback: %w", err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		response.Body.Close()
+		if readErr != nil {
+			if attempt == 0 {
+				if waitErr := waitFeedbackRetry(request.Context()); waitErr != nil {
+					return nil, fmt.Errorf("read feedback response: %w", waitErr)
+				}
+				continue
+			}
+			return nil, fmt.Errorf("read feedback response: %w", readErr)
+		}
+		if response.StatusCode == http.StatusCreated {
+			return body, nil
+		}
+		if attempt == 0 && retryableFeedbackResponse(response.StatusCode, body) {
+			if waitErr := waitFeedbackRetry(request.Context()); waitErr != nil {
+				return nil, fmt.Errorf("submit feedback: %w", waitErr)
+			}
+			continue
+		}
+		return nil, fmt.Errorf("feedback request failed: %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	panic("unreachable")
+}
+
+func waitFeedbackRetry(ctx context.Context) error {
+	timer := time.NewTimer(feedbackRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func retryableFeedbackResponse(statusCode int, body []byte) bool {
+	var response struct {
+		Detail struct {
+			Error struct {
+				Retryable *bool `json:"retryable"`
+			} `json:"error"`
+		} `json:"detail"`
+	}
+	parsed := json.Unmarshal(body, &response) == nil && response.Detail.Error.Retryable != nil
+	if parsed {
+		return *response.Detail.Error.Retryable
+	}
+	return statusCode == http.StatusRequestTimeout ||
+		statusCode == http.StatusTooManyRequests ||
+		statusCode >= 500
 }
 
 func writeFeedbackMultipart(writer *multipart.Writer, metadata feedbackMetadata, attachments []feedbackAttachment) error {

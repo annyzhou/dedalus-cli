@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v3"
 )
@@ -29,6 +31,9 @@ func TestFeedbackCommandSendsJSONWithoutLogs(t *testing.T) {
 		require.Equal(t, "application/json", r.Header.Get("Content-Type"))
 		require.Equal(t, "Bearer test-key", r.Header.Get("Authorization"))
 		require.Equal(t, "dedalus feedback", r.Header.Get("X-Dedalus-CLI-Command"))
+		idempotencyKey, err := uuid.Parse(r.Header.Get("Idempotency-Key"))
+		require.NoError(t, err)
+		require.Equal(t, uuid.Version(7), idempotencyKey.Version())
 
 		var metadata feedbackMetadata
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&metadata))
@@ -48,6 +53,80 @@ func TestFeedbackCommandSendsJSONWithoutLogs(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.JSONEq(t, `{"id":"feedback_123"}`, output.String())
+}
+
+func TestFeedbackCommandRetriesWithSameIdempotencyKey(t *testing.T) {
+	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
+	originalDelay := feedbackRetryDelay
+	feedbackRetryDelay = 0
+	t.Cleanup(func() { feedbackRetryDelay = originalDelay })
+
+	var keys []string
+	attempt := 0
+	setFeedbackTransport(t, func(r *http.Request) *http.Response {
+		attempt++
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		if attempt == 1 {
+			return feedbackStatusResponse(
+				http.StatusServiceUnavailable,
+				`{"detail":{"error":{"retryable":true}}}`,
+			)
+		}
+		return feedbackResponse(`{"id":"feedback_retry"}`)
+	})
+
+	err := testFeedbackCommand(io.Discard).Run(
+		context.Background(),
+		[]string{"dedalus", "--base-url", "https://api.test", "feedback", "retry me"},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 2, attempt)
+	require.NotEmpty(t, keys[0])
+	require.Equal(t, keys[0], keys[1])
+}
+
+func TestFeedbackCommandDoesNotRetryNonRetryableFailure(t *testing.T) {
+	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
+	attempts := 0
+	setFeedbackTransport(t, func(r *http.Request) *http.Response {
+		attempts++
+		return feedbackStatusResponse(
+			http.StatusBadGateway,
+			`{"detail":{"error":{"retryable":false}}}`,
+		)
+	})
+
+	err := testFeedbackCommand(io.Discard).Run(
+		context.Background(),
+		[]string{"dedalus", "--base-url", "https://api.test", "feedback", "bad config"},
+	)
+	require.ErrorContains(t, err, "502 Bad Gateway")
+	require.Equal(t, 1, attempts)
+}
+
+func TestFeedbackCommandRetriesUnreadableResponse(t *testing.T) {
+	t.Setenv("DEDALUS_DEBUG_DIR", t.TempDir())
+	originalDelay := feedbackRetryDelay
+	feedbackRetryDelay = 0
+	t.Cleanup(func() { feedbackRetryDelay = originalDelay })
+
+	attempts := 0
+	setFeedbackTransport(t, func(r *http.Request) *http.Response {
+		attempts++
+		if attempts == 1 {
+			response := feedbackResponse("")
+			response.Body = unreadableFeedbackBody{}
+			return response
+		}
+		return feedbackResponse(`{"id":"feedback_retry"}`)
+	})
+
+	err := testFeedbackCommand(io.Discard).Run(
+		context.Background(),
+		[]string{"dedalus", "--base-url", "https://api.test", "feedback", "retry me"},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 2, attempts)
 }
 
 func TestFeedbackCommandAutoSendsFailedInvocation(t *testing.T) {
@@ -233,13 +312,25 @@ func setFeedbackTransport(t *testing.T, handler func(*http.Request) *http.Respon
 }
 
 func feedbackResponse(body string) *http.Response {
+	return feedbackStatusResponse(http.StatusCreated, body)
+}
+
+func feedbackStatusResponse(statusCode int, body string) *http.Response {
 	return &http.Response{
-		StatusCode: http.StatusCreated,
-		Status:     "201 Created",
+		StatusCode: statusCode,
+		Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
+
+type unreadableFeedbackBody struct{}
+
+func (unreadableFeedbackBody) Read([]byte) (int, error) {
+	return 0, errors.New("truncated response")
+}
+
+func (unreadableFeedbackBody) Close() error { return nil }
 
 func attachmentNames(attachments []feedbackAttachment) []string {
 	names := make([]string, len(attachments))
