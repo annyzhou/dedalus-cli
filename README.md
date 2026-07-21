@@ -79,7 +79,10 @@ dedalus feedback --include-logs=true "machine create returned 500"
 ```
 
 `--include-logs` accepts `auto` (the default), `true`, or `false`. Only
-first-party Dedalus diagnostic artifacts can be uploaded.
+first-party Dedalus diagnostic artifacts can be uploaded. Reports that receive
+a retryable or ambiguous result remain in `~/.dedalus/feedback` with private
+file permissions and are replayed with the same idempotency key on the next run.
+Replay requires the same CLI credentials and API endpoint.
 
 ```sh
 dedalus machines create \
