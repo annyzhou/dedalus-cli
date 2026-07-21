@@ -20,6 +20,7 @@ import (
 )
 
 const feedbackProductionURL = "https://api.dedaluslabs.ai"
+const feedbackMessageMaxCharacters = 10_000
 
 var feedbackHTTPClient = &http.Client{Timeout: 30 * time.Second}
 var feedbackRequestID = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
@@ -91,6 +92,16 @@ func handleFeedback(ctx context.Context, command *cli.Command) error {
 	if message == "" {
 		return fmt.Errorf("message is required\nRun 'dedalus feedback --help' for usage information")
 	}
+	if len([]rune(message)) > feedbackMessageMaxCharacters {
+		return fmt.Errorf("message must be at most %d characters", feedbackMessageMaxCharacters)
+	}
+	replayed, err := flushFeedbackOutbox(ctx, command, message)
+	if err != nil {
+		return err
+	}
+	if replayed != nil {
+		return writeFeedbackReceipt(command, replayed)
+	}
 	attachments, failure, err := selectFeedbackBundle(command.String("include-logs"), time.Now())
 	if err != nil {
 		return err
@@ -117,55 +128,86 @@ func handleFeedback(ctx context.Context, command *cli.Command) error {
 		}
 	}
 
-	request, err := feedbackRequest(ctx, command, metadata, attachments)
+	pending, err := newFeedbackPending(command, message, metadata, attachments)
 	if err != nil {
 		return err
 	}
-	body, err := submitFeedback(request)
+	pending, err = saveFeedbackPending(pending)
 	if err != nil {
 		return err
 	}
-	if !json.Valid(body) {
-		return fmt.Errorf("feedback response is not valid JSON")
+	body, err := submitPendingFeedback(ctx, command, pending)
+	if err != nil {
+		return err
 	}
+	return writeFeedbackReceipt(command, body)
+}
+
+func writeFeedbackReceipt(command *cli.Command, body []byte) error {
 	writer := command.Root().Writer
 	if writer == nil {
 		writer = os.Stdout
 	}
-	_, err = fmt.Fprintln(writer, string(body))
+	_, err := fmt.Fprintln(writer, string(body))
 	return err
 }
 
-func feedbackRequest(ctx context.Context, command *cli.Command, metadata feedbackMetadata, attachments []feedbackAttachment) (*http.Request, error) {
+func newFeedbackPending(command *cli.Command, message string, metadata feedbackMetadata, attachments []feedbackAttachment) (feedbackPendingRequest, error) {
+	body, contentType, err := feedbackBody(metadata, attachments)
+	if err != nil {
+		return feedbackPendingRequest{}, err
+	}
+	idempotencyKey, err := uuid.NewV7()
+	if err != nil {
+		return feedbackPendingRequest{}, fmt.Errorf("create feedback idempotency key: %w", err)
+	}
+	return feedbackPendingRequest{
+		Version:         feedbackOutboxVersion,
+		IdempotencyKey:  strings.ReplaceAll(idempotencyKey.String(), "-", ""),
+		Endpoint:        feedbackEndpoint(command),
+		AuthFingerprint: feedbackAuthFingerprint(command),
+		Message:         message,
+		ContentType:     contentType,
+		Body:            body,
+		CreatedAt:       time.Now().UTC(),
+	}, nil
+}
+
+func feedbackBody(metadata feedbackMetadata, attachments []feedbackAttachment) ([]byte, string, error) {
 	var body bytes.Buffer
 	contentType := "application/json"
 	if len(attachments) == 0 {
 		encoded, err := json.Marshal(metadata)
 		if err != nil {
-			return nil, fmt.Errorf("encode feedback: %w", err)
+			return nil, "", fmt.Errorf("encode feedback: %w", err)
 		}
 		body.Write(encoded)
 	} else {
 		writer := multipart.NewWriter(&body)
 		if err := writeFeedbackMultipart(writer, metadata, attachments); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if err := writer.Close(); err != nil {
-			return nil, fmt.Errorf("close feedback multipart body: %w", err)
+			return nil, "", fmt.Errorf("close feedback multipart body: %w", err)
 		}
 		contentType = writer.FormDataContentType()
 	}
+	return body.Bytes(), contentType, nil
+}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, feedbackEndpoint(command), &body)
+func feedbackRequest(ctx context.Context, command *cli.Command, pending feedbackPendingRequest) (*http.Request, error) {
+	if pending.AuthFingerprint != feedbackAuthFingerprint(command) {
+		return nil, fmt.Errorf("pending feedback was created with different CLI credentials")
+	}
+	if pending.Endpoint != feedbackEndpoint(command) {
+		return nil, fmt.Errorf("pending feedback was created for a different API endpoint")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, pending.Endpoint, bytes.NewReader(pending.Body))
 	if err != nil {
 		return nil, fmt.Errorf("create feedback request: %w", err)
 	}
-	request.Header.Set("Content-Type", contentType)
-	idempotencyKey, err := uuid.NewV7()
-	if err != nil {
-		return nil, fmt.Errorf("create feedback idempotency key: %w", err)
-	}
-	request.Header.Set("Idempotency-Key", strings.ReplaceAll(idempotencyKey.String(), "-", ""))
+	request.Header.Set("Content-Type", pending.ContentType)
+	request.Header.Set("Idempotency-Key", pending.IdempotencyKey)
 	request.Header.Set("User-Agent", fmt.Sprintf("Dedalus/CLI %s", Version))
 	request.Header.Set("X-Dedalus-CLI-Command", "dedalus feedback")
 	root := command.Root()
@@ -180,6 +222,54 @@ func feedbackRequest(ctx context.Context, command *cli.Command, metadata feedbac
 	}
 	return request, nil
 }
+
+func flushFeedbackOutbox(ctx context.Context, command *cli.Command, message string) ([]byte, error) {
+	pending, err := loadFeedbackOutbox()
+	if err != nil {
+		return nil, err
+	}
+	var replayed []byte
+	for _, item := range pending {
+		body, submitErr := submitPendingFeedback(ctx, command, item)
+		if submitErr != nil {
+			return nil, submitErr
+		}
+		if item.Message == message {
+			replayed = body
+		}
+	}
+	return replayed, nil
+}
+
+func submitPendingFeedback(ctx context.Context, command *cli.Command, pending feedbackPendingRequest) ([]byte, error) {
+	request, err := feedbackRequest(ctx, command, pending)
+	if err != nil {
+		return nil, err
+	}
+	body, err := submitFeedback(request)
+	if err != nil {
+		if submitErr, ok := err.(*feedbackSubmitError); ok && !submitErr.retain {
+			if removeErr := removeFeedbackPending(pending); removeErr != nil {
+				return nil, removeErr
+			}
+		}
+		return nil, err
+	}
+	if !json.Valid(body) {
+		return nil, fmt.Errorf("feedback response is not valid JSON")
+	}
+	if err := removeFeedbackPending(pending); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+type feedbackSubmitError struct {
+	message string
+	retain  bool
+}
+
+func (e *feedbackSubmitError) Error() string { return e.message }
 
 func submitFeedback(request *http.Request) ([]byte, error) {
 	for attempt := range 2 {
@@ -200,7 +290,7 @@ func submitFeedback(request *http.Request) ([]byte, error) {
 				}
 				continue
 			}
-			return nil, fmt.Errorf("submit feedback: %w", err)
+			return nil, &feedbackSubmitError{message: fmt.Sprintf("submit feedback: %v", err), retain: true}
 		}
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		response.Body.Close()
@@ -211,9 +301,9 @@ func submitFeedback(request *http.Request) ([]byte, error) {
 				}
 				continue
 			}
-			return nil, fmt.Errorf("read feedback response: %w", readErr)
+			return nil, &feedbackSubmitError{message: fmt.Sprintf("read feedback response: %v", readErr), retain: true}
 		}
-		if response.StatusCode == http.StatusCreated {
+		if response.StatusCode == http.StatusAccepted {
 			return body, nil
 		}
 		if attempt == 0 && retryableFeedbackResponse(response.StatusCode, body) {
@@ -222,7 +312,10 @@ func submitFeedback(request *http.Request) ([]byte, error) {
 			}
 			continue
 		}
-		return nil, fmt.Errorf("feedback request failed: %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return nil, &feedbackSubmitError{
+			message: fmt.Sprintf("feedback request failed: %s: %s", response.Status, strings.TrimSpace(string(body))),
+			retain:  retryableFeedbackResponse(response.StatusCode, body),
+		}
 	}
 	panic("unreachable")
 }
